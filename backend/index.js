@@ -18,6 +18,9 @@ app.use('/api/events', eventRoutes);
 const dropoffRoutes = require('./routes/dropoffs');
 app.use('/api/dropoffs', dropoffRoutes);
 
+const campaignRoutes = require('./routes/campaigns');
+app.use('/api/campaigns', campaignRoutes);
+
 // MongoDB Connection
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB connected'))
