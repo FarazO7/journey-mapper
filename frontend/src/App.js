@@ -1,10 +1,10 @@
 import React, { useState, useRef, useCallback } from 'react';
 import axios from 'axios';
-import dagre from 'dagre';
 import ReactFlow, {
   Background, Controls, MiniMap,
 } from 'reactflow';
 import 'reactflow/dist/style.css';
+import { layoutGraph, statsFromGraph } from './graphLayout';
 
 // ─── Design System ────────────────────────────────────────────────────────────
 const ds = {
@@ -312,94 +312,6 @@ const ProgressBar = ({ channel, progress, color }) => (
   </div>
 );
 
-// ─── Build flat nodes/edges from tree ─────────────────────────────────────────
-
-const NODE_WIDTH  = 200;
-const NODE_HEIGHT = 100;
-
-const flattenTree = (steps) => {
-  const nodes = [];
-  const edges = [];
-  let nodeIndex = 0;
-
-  // First pass — collect all nodes and edges
-  const traverse = (step, parentId) => {
-    const id = `node-${nodeIndex++}`;
-
-    nodes.push({
-      id,
-      type: 'custom',
-      position: { x: 0, y: 0 }, // dagre sets this
-      data: {
-        label:         step.step,
-        type:          step.type,
-        messageType:   step.messageType,
-        phase:         step.phase,
-        timing:        step.timing,
-        tier:          step.tier,
-        shouldCampaign: step.shouldCampaign,
-        step,
-      },
-    });
-
-    if (parentId) {
-      edges.push({
-        id:       `e-${parentId}-${id}`,
-        source:   parentId,
-        target:   id,
-        animated: step.shouldCampaign,
-        style: {
-          stroke: step.type === 'dropoff'
-            ? ds.color.red
-            : step.type === 'retention'
-              ? ds.color.orange
-              : ds.color.border,
-          strokeWidth:     1.5,
-          strokeDasharray: step.type === 'dropoff' ? '5,3' : 'none',
-        },
-      });
-    }
-
-    if (step.children?.length) {
-      step.children.forEach(child => traverse(child, id));
-    }
-
-    return id;
-  };
-
-  steps.forEach(step => traverse(step, null));
-
-  // Second pass — run dagre layout
-  const g = new dagre.graphlib.Graph();
-  g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({
-    rankdir:  'LR',   // left to right — proper tree
-    ranksep:  80,     // horizontal space between levels
-    nodesep:  40,     // vertical space between nodes
-    marginx:  40,
-    marginy:  40,
-  });
-
-  nodes.forEach(n => g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT }));
-  edges.forEach(e => g.setEdge(e.source, e.target));
-
-  dagre.layout(g);
-
-  // Apply dagre positions back to nodes
-  const layoutedNodes = nodes.map(n => {
-    const pos = g.node(n.id);
-    return {
-      ...n,
-      position: {
-        x: pos.x - NODE_WIDTH  / 2,
-        y: pos.y - NODE_HEIGHT / 2,
-      },
-    };
-  });
-
-  return { nodes: layoutedNodes, edges };
-};
-
 // ─── Generate session ID ──────────────────────────────────────────────────────
 const genSessionId = () => `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -463,11 +375,17 @@ export default function App() {
 
       if (res.data.aborted) {
         setAborted(true);
-      } else {
-        const { nodes: n, edges: e } = flattenTree(res.data.journey.journeySteps);
+      } else if (res.data.success && res.data.graph?.nodes?.length) {
+        // The crawl API returns { brand, graph: { nodes, edges } }; graphLayout
+        // turns that into React Flow nodes/edges. Keep brand fields on `journey`
+        // so the sidebar + campaign generator read them unchanged.
+        const { nodes: n, edges: e } = layoutGraph(res.data.graph, ds);
         setNodes(n);
         setEdges(e);
-        setJourney(res.data.journey);
+        setJourney({ ...res.data.brand, graph: res.data.graph });
+      } else {
+        // Missing/malformed graph or success:false — surface it instead of crashing.
+        alert('Error: ' + (res.data.error || 'No journey data returned for this URL.'));
       }
     } catch (err) {
       if (!aborted) alert('Error: ' + err.message);
@@ -544,20 +462,7 @@ export default function App() {
   };
 
   // ── Stats ──────────────────────────────────────────────────────────────────
-  const countNodes = (steps) => {
-    let total = 0, dropoffs = 0, happy = 0, retention = 0;
-    const walk = (arr) => arr.forEach(s => {
-      total++;
-      if (s.type === 'dropoff') dropoffs++;
-      if (s.type === 'happy_path') happy++;
-      if (s.type === 'retention') retention++;
-      if (s.children?.length) walk(s.children);
-    });
-    walk(steps || []);
-    return { total, dropoffs, happy, retention };
-  };
-
-  const stats = journey ? countNodes(journey.journeySteps) : {};
+  const stats = journey ? statsFromGraph(journey.graph) : {};
   const campaign = activeChannel ? channelData[activeChannel] : null;
 
   const channelConfig = {
