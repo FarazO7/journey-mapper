@@ -5,8 +5,8 @@
  *
  * Turns a list of crawled pages into a directed ACYCLIC graph of user STATES.
  *
- *   - One node per state (all product pages collapse into ONE shared "Product" node;
- *     category pages become real, site-specific category nodes).
+ *   - One node per state (all product pages collapse into ONE shared "Product" node,
+ *     and likewise all category/subcategory pages collapse into ONE shared "Category" node).
  *   - Edges mean "a user can move from A to B". A node may have many incoming edges
  *     (convergence) — e.g. Home, Search and every Category all point into Product —
  *     but no path ever loops back (acyclic).
@@ -76,20 +76,28 @@ function conversionGraph() {
     { id: 'cart_abandoned',     label: 'Cart Abandoned',      kind: 'conversion', type: 'dropoff',    phase: 'pre_purchase',  messageType: 'MARKETING', shouldCampaign: true, timing: '1 hour after cart abandoned' },
     { id: 'checkout',           label: 'Checkout',            kind: 'conversion', type: 'happy_path', phase: 'purchase',      messageType: 'UTILITY' },
     { id: 'checkout_abandoned', label: 'Checkout Abandoned',  kind: 'conversion', type: 'dropoff',    phase: 'purchase',      messageType: 'MARKETING', shouldCampaign: true, timing: '30 min after checkout abandoned' },
+    { id: 'payment_successful', label: 'Payment Successful',  kind: 'conversion', type: 'happy_path', phase: 'purchase',      messageType: 'UTILITY' },
+    { id: 'payment_failed',     label: 'Payment Failed',      kind: 'conversion', type: 'dropoff',    phase: 'purchase',      messageType: 'UTILITY',   shouldCampaign: true, timing: '15 min after payment failure' },
     { id: 'order_placed',       label: 'Order Placed',        kind: 'conversion', type: 'happy_path', phase: 'post_purchase', messageType: 'UTILITY' },
+    { id: 'order_delivered',    label: 'Order Delivered',     kind: 'conversion', type: 'happy_path', phase: 'post_purchase', messageType: 'UTILITY' },
+    { id: 'delivery_delayed',   label: 'Delivery Delayed',    kind: 'conversion', type: 'dropoff',    phase: 'post_purchase', messageType: 'UTILITY',   shouldCampaign: true, timing: '5 days after dispatch with no delivery' },
     { id: 'account',            label: 'Account / Login',     kind: 'conversion', type: 'happy_path', phase: 'pre_purchase',  messageType: 'UTILITY' },
     { id: 'logged_in',          label: 'Logged In',           kind: 'conversion', type: 'happy_path', phase: 'pre_purchase',  messageType: 'UTILITY' },
     { id: 'guest',              label: 'Continued as Guest',  kind: 'conversion', type: 'happy_path', phase: 'pre_purchase',  messageType: 'UTILITY' },
   ];
   const edges = [
-    ['product', 'add_to_cart'],          // browsing -> intent
-    ['add_to_cart', 'checkout'],         // Yes -> proceed
-    ['add_to_cart', 'cart_abandoned'],   // No  -> abandoned
-    ['checkout', 'order_placed'],        // Yes -> placed
-    ['checkout', 'checkout_abandoned'],  // No  -> abandoned
-    ['home', 'account'],                 // account is a site-wide action
-    ['account', 'logged_in'],            // Yes
-    ['account', 'guest'],                // No
+    ['product', 'add_to_cart'],                 // browsing -> intent
+    ['add_to_cart', 'checkout'],                // Yes -> proceed
+    ['add_to_cart', 'cart_abandoned'],          // No  -> abandoned
+    ['checkout', 'checkout_abandoned'],         // left before paying
+    ['checkout', 'payment_successful'],         // payment goes through
+    ['checkout', 'payment_failed'],             // payment fails -> dropoff
+    ['payment_successful', 'order_placed'],     // order confirmed
+    ['order_placed', 'order_delivered'],        // delivered successfully
+    ['order_placed', 'delivery_delayed'],       // delayed / RTO risk -> dropoff
+    ['home', 'account'],                        // account is a site-wide action
+    ['account', 'logged_in'],                   // Yes
+    ['account', 'guest'],                       // No
   ];
   return { nodes, edges };
 }
@@ -119,16 +127,15 @@ function buildJourneyGraph(pages, opts = {}) {
     }
   }
 
-  // Real, site-specific category + subcategory nodes.
-  for (const [handle, label] of categories) {
-    addNode({ id: `cat:${handle}`, label: label || 'Category', kind: 'discovery', type: 'happy_path', phase: 'pre_purchase', messageType: 'MARKETING' });
-  }
-  for (const [handle, info] of subcategories) {
-    addNode({ id: `subcat:${handle}`, label: info.label || 'Subcategory', kind: 'discovery', type: 'happy_path', phase: 'pre_purchase', messageType: 'MARKETING' });
+  // Single shared Category node — all category/subcategory pages collapse into one,
+  // exactly like product pages do (avoids flooding the graph with per-handle nodes).
+  const hasCategory = categories.size > 0 || subcategories.size > 0;
+  if (hasCategory) {
+    addNode({ id: 'category', label: 'Category Page', kind: 'discovery', type: 'happy_path', phase: 'pre_purchase', messageType: 'MARKETING' });
   }
 
   // Single shared Product node. Categories imply products exist.
-  if (hasProduct || categories.size) {
+  if (hasProduct || hasCategory) {
     addNode({ id: 'product', label: 'Product Page', kind: 'discovery', type: 'happy_path', phase: 'pre_purchase', messageType: 'MARKETING' });
     hasProduct = true;
   }
@@ -145,23 +152,10 @@ function buildJourneyGraph(pages, opts = {}) {
     edges.push({ source: s, target: t });
   };
 
-  for (const handle of categories.keys()) addEdge('home', `cat:${handle}`);
-
-  const subsByParent = new Map();
-  for (const [handle, info] of subcategories) {
-    if (!subsByParent.has(info.parent)) subsByParent.set(info.parent, []);
-    subsByParent.get(info.parent).push(handle);
-  }
-  for (const handle of categories.keys()) {
-    const subs = subsByParent.get(handle) || [];
-    if (subs.length) {
-      for (const sh of subs) {
-        addEdge(`cat:${handle}`, `subcat:${sh}`);
-        if (hasProduct) addEdge(`subcat:${sh}`, 'product');
-      }
-    } else if (hasProduct) {
-      addEdge(`cat:${handle}`, 'product');
-    }
+  // Discovery convergence: home -> category -> product (mirrors the product collapse).
+  if (hasCategory) {
+    addEdge('home', 'category');
+    if (hasProduct) addEdge('category', 'product');
   }
 
   if (hasProduct) addEdge('home', 'product');           // featured products linked from home
@@ -203,6 +197,8 @@ function assertValid(graph) {
   const ids = new Set(graph.nodes.map((n) => n.id));
   const productNodes = graph.nodes.filter((n) => n.id === 'product');
   if (productNodes.length > 1) throw new Error('product is not a single node');
+  const categoryNodes = graph.nodes.filter((n) => n.id === 'category');
+  if (categoryNodes.length > 1) throw new Error('category is not a single node');
 
   // cycle check (DFS)
   const adj = new Map(graph.nodes.map((n) => [n.id, []]));

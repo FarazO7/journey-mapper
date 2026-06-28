@@ -127,23 +127,43 @@ Respond ONLY with valid JSON, no markdown:
   "personalizationVariables": ["[First Name]"]
 }`;
 
-// ── Apify crawler (Playwright for JS-rendered storefronts) ────────────────────
+// ── Apify crawler (cheerio — fast static-HTML crawl of D2C storefronts) ───────
 // We only need page URLs; classification is URL-based. We still exclude the
 // transactional pages (cart/checkout/account/search) because those states are
 // INJECTED by the graph builder, not crawled.
+const POLL_INTERVAL_MS = 4000;
+const MAX_POLL_ATTEMPTS = 75; // ~5 min budget; a 40-page cheerio crawl finishes well within this
+
+// Follow redirects so the actor's link-enqueuing scope matches where the
+// storefront actually lives (e.g. www.mamaearth.in -> mamaearth.in). A redirecting
+// start URL otherwise leaves the crawler unable to follow the page's links, so it
+// returns only the homepage and the conversion funnel gets pruned.
+const resolveStartUrl = async (url) => {
+  try {
+    const res = await axios.head(url, { maxRedirects: 5, timeout: 15000, validateStatus: () => true });
+    return res.request?.res?.responseUrl || url;
+  } catch {
+    return url; // HEAD unsupported / network hiccup — use the URL as given
+  }
+};
+
 const crawlWithApify = async (url, sessionId) => {
   const APIFY_TOKEN = process.env.APIFY_API_KEY;
+  const startUrl = await resolveStartUrl(url);
+  if (process.env.CRAWL_DEBUG) console.log('[crawl] input:', url, '-> startUrl:', startUrl);
 
   const startRes = await axios.post(
     `https://api.apify.com/v2/acts/aYG0l9s7dbB7j3gbS/runs?token=${APIFY_TOKEN}`,
     {
-      startUrls: [{ url }],
+      startUrls: [{ url: startUrl }],
       maxCrawlDepth: 4,
       maxCrawlPages: 40,
       maxConcurrency: 5,
-      // JS rendering — most D2C storefronts render nav/category links client-side.
-      // cheerio (static HTML) misses them. Use 'cheerio' only as a cheap fallback.
-      crawlerType: 'playwright:firefox',
+      // cheerio (static HTML): D2C / Shopify storefronts expose their category and
+      // collection links in server-rendered HTML, so cheerio finds them — and it is
+      // far faster and lighter than a browser engine, which was timing out the poll
+      // loop and exhausting the account's actor-memory limit.
+      crawlerType: 'cheerio',
       excludeUrlGlobs: [
         '**/*.pdf', '**/*.jpg', '**/*.png', '**/*.gif',
         '**/cart**', '**/checkout**', '**/account**',
@@ -156,22 +176,25 @@ const crawlWithApify = async (url, sessionId) => {
   const runId = startRes.data.data.id;
   if (sessionId) activeRuns[sessionId] = runId;
 
+  const abortRun = () =>
+    axios.post(`https://api.apify.com/v2/actor-runs/${runId}/abort?token=${APIFY_TOKEN}`).catch(() => {});
+
   let status = 'RUNNING';
   let attempts = 0;
   while (status === 'RUNNING' || status === 'READY') {
     if (sessionId && activeRuns[sessionId] === 'ABORTED') {
-      await axios
-        .post(`https://api.apify.com/v2/actor-runs/${runId}/abort?token=${APIFY_TOKEN}`)
-        .catch(() => {});
+      await abortRun();
       throw new Error('CRAWL_ABORTED');
     }
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     const statusRes = await axios.get(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
     );
     status = statusRes.data.data.status;
     attempts++;
-    if (attempts > 30) break;
+    // Out of time budget: abort the run so it stops consuming the account's memory
+    // quota (a lingering run would 402 the next crawl), then return what we have.
+    if (attempts >= MAX_POLL_ATTEMPTS) { await abortRun(); break; }
   }
 
   if (sessionId) delete activeRuns[sessionId];
@@ -180,9 +203,14 @@ const crawlWithApify = async (url, sessionId) => {
     `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${APIFY_TOKEN}&limit=200`
   );
   // Normalise to { url } — tolerate different actor output shapes.
-  return (resultsRes.data || [])
+  const pages = (resultsRes.data || [])
     .map((item) => ({ url: item.url || item.loadedUrl || item.pageUrl }))
     .filter((p) => p.url);
+  if (process.env.CRAWL_DEBUG) {
+    console.log('[crawl] runId:', runId, '| final status:', status, '| attempts:', attempts,
+      '| raw:', (resultsRes.data || []).length, '| normalized:', pages.length);
+  }
+  return pages;
 };
 
 // ── Routes ─────────────────────────────────────────────────────────────────────
