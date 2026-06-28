@@ -12,6 +12,12 @@ app.use(express.json());
 const crawlerRoutes = require('./routes/crawler');
 app.use('/api/crawler', crawlerRoutes);
 
+const eventRoutes = require('./routes/events');
+app.use('/api/events', eventRoutes);
+
+const dropoffRoutes = require('./routes/dropoffs');
+app.use('/api/dropoffs', dropoffRoutes);
+
 // MongoDB Connection
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB connected'))
