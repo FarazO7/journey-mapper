@@ -1,6 +1,6 @@
 'use strict';
 
-const { buildJourneyGraph, assertValid } = require('./journeyGraph');
+const { buildJourneyGraph, assertValid, classifyPage } = require('./journeyGraph');
 
 const url = (p) => ({ url: `https://shop.example.com${p}` });
 
@@ -95,5 +95,93 @@ describe('buildJourneyGraph — invariants', () => {
       expect(e).toHaveProperty('source');
       expect(e).toHaveProperty('target');
     }
+  });
+});
+
+describe('classifyPage — multiple URL schemes', () => {
+  const state = (p) => classifyPage({ url: `https://x.com${p}` }).state;
+
+  test('homepage', () => {
+    expect(state('/')).toBe('home');
+  });
+
+  test('Shopify keyword scheme (unchanged)', () => {
+    expect(state('/collections/face-wash')).toBe('category');
+    expect(state('/collections/skin/face-wash')).toBe('subcategory');
+    expect(state('/products/vitamin-c-serum')).toBe('product');
+  });
+
+  test('other keyword schemes', () => {
+    expect(state('/c/electronics')).toBe('category');
+    expect(state('/category/men')).toBe('category');
+    expect(state('/sku/12345')).toBe('product');
+    expect(state('/dp/B0ABC')).toBe('product');
+  });
+
+  test('product-by-shape: keyword-free SKU id (e.g. HealthKart /sv/.../SP-132971)', () => {
+    expect(state('/sv/smash-creatine/SP-132971')).toBe('product');
+    expect(state('/buy/widget/987654')).toBe('product');
+  });
+
+  test('slug-based category: keyword-free listing pages', () => {
+    expect(state('/whey-protein')).toBe('category');
+    expect(state('/multivitamins/for-men')).toBe('category');
+    expect(state('/sale/gnc')).toBe('category');
+  });
+
+  test('non-commerce slugs are NOT categories', () => {
+    expect(state('/policies/shipping-policy')).toBe('unknown');
+    expect(state('/pages/plant')).toBe('unknown');
+    expect(state('/about-us')).toBe('unknown');
+    expect(state('/blog/how-to-bulk')).toBe('unknown');
+  });
+
+  test('4-digit years are not mistaken for product ids', () => {
+    expect(state('/sale-2024')).toBe('category'); // slug, not product (>=5 digits needed)
+  });
+});
+
+describe('buildJourneyGraph — non-Shopify storefront does not collapse', () => {
+  // HealthKart-style: SKU-id products + keyword-free category slugs, no /collections/.
+  const healthkartPages = [
+    url('/'),
+    url('/whey-protein'), url('/omega-3'), url('/multivitamins'), url('/creatine'),
+    url('/multivitamins/for-men'), url('/sale/gnc'),
+    url('/sv/smash-creatine/SP-132971'),
+    url('/sv/dexter-omega-3/SP-103860'),
+    url('/policies/shipping-policy'), // ignored (non-commerce)
+  ];
+
+  test('yields category + product nodes and the full funnel (not a 4-node collapse)', () => {
+    const g = buildJourneyGraph(healthkartPages);
+    const ids = g.nodes.map((n) => n.id);
+    expect(ids).toContain('category');
+    expect(ids).toContain('product');
+    for (const f of ['add_to_cart', 'cart_abandoned', 'checkout', 'payment_failed', 'order_placed', 'order_delivered']) {
+      expect(ids).toContain(f);
+    }
+    expect(ids.length).toBeGreaterThan(4);
+    expect(assertValid(g).ok).toBe(true);
+  });
+
+  test('Shopify set still yields its expected graph (no regression)', () => {
+    const g = buildJourneyGraph(manyCategoryPages);
+    const ids = g.nodes.map((n) => n.id);
+    expect(ids.filter((id) => id === 'category')).toHaveLength(1);
+    expect(ids.filter((id) => id === 'product')).toHaveLength(1);
+    expect(ids).toContain('order_delivered');
+    expect(assertValid(g).ok).toBe(true);
+  });
+});
+
+describe('buildJourneyGraph — last-resort net for unrecognised schemes', () => {
+  test('many crawled pages with no product/category signal still form a funnel', () => {
+    const odd = ['/aa/bb/cc/dd', '/ee/ff/gg/hh', '/ii/jj/kk/ll', '/mm/nn/oo/pp',
+      '/qq/rr/ss/tt', '/uu/vv/ww/xx', '/yy/zz/ab/cd', '/ef/gh/ij/kl', '/mn/op/qr/st'].map(url);
+    const g = buildJourneyGraph([url('/'), ...odd]);
+    const ids = g.nodes.map((n) => n.id);
+    expect(ids).toContain('product');
+    expect(ids).toContain('add_to_cart');
+    expect(assertValid(g).ok).toBe(true);
   });
 });
