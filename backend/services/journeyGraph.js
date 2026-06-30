@@ -40,8 +40,21 @@ function pathSegments(rawUrl) {
   }
 }
 
+// Path sections that are NOT shopping/listing pages — kept out of the slug-category
+// heuristic so content/account pages don't masquerade as categories.
+const NON_COMMERCE = new Set([
+  'policies', 'policy', 'pages', 'page', 'blog', 'blogs', 'about', 'about-us',
+  'contact', 'contact-us', 'help', 'faq', 'faqs', 'support', 'terms', 'privacy',
+  'returns', 'return', 'refund', 'shipping', 'track', 'track-order', 'orders', 'order',
+  'account', 'login', 'signin', 'register', 'signup', 'cart', 'checkout', 'wishlist',
+  'compare', 'careers', 'jobs', 'press', 'sitemap', 'store-locator', 'stores',
+  'gift-card', 'gift-cards', 'profile', 'auth',
+]);
+
 // ── classification ──────────────────────────────────────────────────────────
 // state: 'home' | 'category' | 'subcategory' | 'product' | 'search' | 'unknown'
+// URL-only, scheme-agnostic: keyword signals first, then URL-shape heuristics so we
+// also classify non-Shopify storefronts (e.g. /sv/<slug>/SP-132971, /whey-protein).
 function classifyPage(page) {
   const url = page && page.url ? page.url : '';
   const segs = pathSegments(url);
@@ -49,7 +62,7 @@ function classifyPage(page) {
 
   if (segs.length === 0) return { state: 'home', label: 'Homepage' };
 
-  const PRODUCT = ['products', 'product', 'p', 'dp', 'item', 'items'];
+  const PRODUCT = ['products', 'product', 'p', 'dp', 'item', 'items', 'sku', 'pd', 'pdp'];
   if (segs.some((s) => PRODUCT.includes(s))) return { state: 'product', label: 'Product Page' };
 
   if (segs.some((s) => ['search', 'find'].includes(s)) || /[?&](q|query|s|keyword)=/.test(lower)) {
@@ -64,6 +77,19 @@ function classifyPage(page) {
     if (!handle || handle === 'all') return { state: 'category', handle: 'shop', label: 'Shop' };
     if (sub) return { state: 'subcategory', handle: `${handle}/${sub}`, parentHandle: handle, label: humanize(sub) };
     return { state: 'category', handle, label: humanize(handle) };
+  }
+
+  // Keyword-free schemes (e.g. /sv/<slug>/SP-132971): a product is identified by the
+  // SHAPE of its last segment — a SKU/product id carrying a run of >=5 digits. The >=5
+  // threshold avoids 4-digit years (e.g. a "sale-2024" collection stays a category).
+  const last = segs[segs.length - 1];
+  if (/\d{5,}/.test(last)) return { state: 'product', label: 'Product Page' };
+
+  // Keyword-free category/listing pages are shallow slugs (e.g. /whey-protein,
+  // /multivitamins/for-men). Treat a depth-1/2 slug path as a category unless its
+  // leading segment is a known non-commerce section.
+  if (segs.length <= 2 && !NON_COMMERCE.has(segs[0]) && segs.every((s) => /^[a-z0-9][a-z0-9-]*$/i.test(s))) {
+    return { state: 'category', handle: segs[0], label: humanize(last) };
   }
 
   return { state: 'unknown', label: humanize(segs[segs.length - 1]) };
@@ -133,6 +159,12 @@ function buildJourneyGraph(pages, opts = {}) {
   if (hasCategory) {
     addNode({ id: 'category', label: 'Category Page', kind: 'discovery', type: 'happy_path', phase: 'pre_purchase', messageType: 'MARKETING' });
   }
+
+  // Last-resort safety net: a real storefront was clearly crawled (many pages) but its
+  // URL scheme matched no product/category signal. Surface a generic Product Page so the
+  // conversion funnel still forms instead of collapsing to just the home/account nodes.
+  const nonHomePages = classified.filter((c) => c.state !== 'home').length;
+  if (!hasProduct && !hasCategory && nonHomePages >= 8) hasProduct = true;
 
   // Single shared Product node. Categories imply products exist.
   if (hasProduct || hasCategory) {
